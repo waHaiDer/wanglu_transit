@@ -13,22 +13,28 @@ int main() {
     char message[BUFSIZE];
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("Socket creation failed");
+        exit(1);
+    }
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); 
 
-    printf("Type messages to send:\n");
-
+    printf("Type messages to send (Ctrl+C to quit):\n");
     while (1) {
         if (fgets(message, BUFSIZE, stdin) == NULL) {
-            break;
+            break; 
         }
 
         message[strcspn(message, "\n")] = '\0';
 
         int n = sendto(sockfd, message, strlen(message), 0,
                        (struct sockaddr*)&server_addr, sizeof(server_addr));
+        if (n < 0) {
+            perror("Send failed");
+        }
     }
 
     close(sockfd);
