@@ -1,8 +1,8 @@
-// client1.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 
 #define PORT 12345
 #define BUFSIZE 1024
