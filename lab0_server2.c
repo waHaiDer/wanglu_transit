@@ -14,10 +14,19 @@ int main() {
     socklen_t addr_len = sizeof(client_addr);
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("Socket creation failed");
+        exit(1);
+    }
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
     server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        exit(1);
+    }
 
     printf("Server2 listening on port %d...\n", PORT);
 
@@ -25,6 +34,7 @@ int main() {
         int n = recvfrom(sockfd, buffer, BUFSIZE, 0, 
                          (struct sockaddr*)&client_addr, &addr_len);
         if (n < 0) {
+            perror("Receive failed");
             continue;
         }
 
@@ -35,3 +45,4 @@ int main() {
     close(sockfd);
     return 0;
 }
+
