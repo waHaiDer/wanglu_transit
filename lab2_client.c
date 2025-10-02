@@ -53,3 +53,60 @@ int main() {
     close(sock);
     return 0;
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/time.h>
+
+int main() {
+    fd_set rfds;
+    struct sockaddr_in server;
+    struct timeval tv;
+    int sock, readSize, addressSize;
+    int retval;
+    int num1, num2, ans;
+
+    sock = socket(PF_INET, SOCK_DGRAM, 0);
+
+    bzero(&server, sizeof(server));
+    server.sin_family = PF_INET;
+    server.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server.sin_port = htons(5678);
+    addressSize = sizeof(server);
+
+    while (1) {
+        printf("Enter first number: ");
+        scanf("%d", &num1);
+        sendto(sock, &num1, sizeof(num1), 0, (struct sockaddr*)&server, sizeof(server));
+
+        printf("Listening for 3 seconds to enter second number...\n");
+
+        FD_ZERO(&rfds);
+        FD_SET(0, &rfds); // stdin
+        tv.tv_sec = 3;
+        tv.tv_usec = 0;
+
+        retval = select(1, &rfds, NULL, NULL, &tv);
+
+        if (retval > 0) {
+            scanf("%d", &num2);
+            sendto(sock, &num2, sizeof(num2), 0, (struct sockaddr*)&server, sizeof(server));
+        } else {
+            printf("No second input. Proceeding with only the first number.\n");
+        }
+
+        // Receive answer from server
+        readSize = recvfrom(sock, &ans, sizeof(ans), 0, (struct sockaddr*)&server, &addressSize);
+        printf("Received result from server: %d\n\n", ans);
+    }
+
+    close(sock);
+    return 0;
+}
