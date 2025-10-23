@@ -113,13 +113,15 @@ static void trim_newline(char *s) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s <server_ip> <port>\n", argv[0]);
-        return 1;
-    }
+    const char *ip = "127.0.0.1";
+    int port = 5678;
 
-    const char *ip = argv[1];
-    int port = atoi(argv[2]);
+    if (argc >= 3) {
+        ip = argv[1];
+        port = atoi(argv[2]);
+    } else {
+        fprintf(stderr, "No args supplied. Using default %s:%d\n", ip, port);
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return 1; }
@@ -128,25 +130,13 @@ int main(int argc, char **argv) {
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &sa.sin_addr) <= 0) {
-        perror("inet_pton");
-        return 1;
-    }
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) <= 0) { perror("inet_pton"); return 1; }
 
     if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
         perror("connect");
         return 1;
     }
 
-    // Start receiver thread
-    pthread_t th;
-    rx_arg_t *rx = (rx_arg_t *)malloc(sizeof(rx_arg_t));
-    rx->fd = fd;
-    if (pthread_create(&th, NULL, rx_thread, rx) != 0) {
-        perror("pthread_create");
-        return 1;
-    }
-    pthread_detach(th);
 
     // Main loop: menu + input
     char line[BUF_SZ];
