@@ -137,6 +137,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // start receiver thread, then the existing menu/input loop...
+    pthread_t th;
+    rx_arg_t *rx = (rx_arg_t *)malloc(sizeof(rx_arg_t));
+    rx->fd = fd;
+    if (pthread_create(&th, NULL, rx_thread, rx) != 0) { perror("pthread_create"); return 1; }
+    pthread_detach(th);
 
     // Main loop: menu + input
     char line[BUF_SZ];
