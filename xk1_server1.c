@@ -3,275 +3,257 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdbool.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#define PORT 5678
-#define MAX_CLIENTS 16
+#define MAX_CLIENTS 64
 #define MAX_USERS   256
-#define BUF_SZ 4096
+#define MAX_NAME    32
+#define MAX_PASS    64
+#define MAX_LINE    1024
 
 typedef struct {
-    char sid[64];
-    char acc[64];
-    char pwd[64];
+    char username[MAX_NAME];
+    char password[MAX_PASS];
+    char student_id[32];
     bool in_use;
 } user_t;
 
 typedef struct {
     int fd;
-    bool in_use;
     bool authed;
-    int user_idx;   // index in users[]
+    char username[MAX_NAME];
 } client_t;
 
-static user_t users[MAX_USERS];
+static user_t   users[MAX_USERS];
 static client_t clients[MAX_CLIENTS];
-static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t users_mtx   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t clients_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-/* ------------ Small I/O helpers ------------ */
-static void safe_send(int fd, const char *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = send(fd, buf + off, len - off, 0);
-        if (n < 0) { if (errno == EINTR) continue; break; }
-        if (n == 0) break;
-        off += (size_t)n;
+static ssize_t send_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char*)buf;
+    size_t left = len;
+    while (left) {
+        ssize_t n = send(fd, p, left, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        left -= (size_t)n;
+        p += n;
     }
+    return (ssize_t)len;
 }
 
-static void send_line(int fd, const char *fmt, ...) {
-    char out[BUF_SZ];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(out, sizeof(out), fmt, ap);
+static int sendf(int fd, const char *fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    size_t L = strlen(out);
-    if (L == 0 || out[L-1] != '\n') {
-        if (L + 1 < sizeof(out)) { out[L] = '\n'; out[L+1] = '\0'; L++; }
-    }
-    safe_send(fd, out, L);
+    if (n < 0) return -1;
+    if ((size_t)n > sizeof(buf)) n = (int)sizeof(buf);
+    return (int)send_all(fd, buf, (size_t)n);
 }
 
+// Read a single line (ending with '\n'), returns length (excludes '\n'), -1 on error, 0 on EOF
 static ssize_t recv_line(int fd, char *out, size_t cap) {
-    size_t pos = 0;
-    while (pos + 1 < cap) {
+    size_t i = 0;
+    while (i + 1 < cap) {
         char c;
         ssize_t n = recv(fd, &c, 1, 0);
-        if (n == 0) return 0;           // peer closed
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        out[pos++] = c;
+        if (n == 0) { // peer closed
+            if (i == 0) return 0;
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (c == '\r') continue;
         if (c == '\n') break;
+        out[i++] = c;
     }
-    out[pos] = '\0';
-    return (ssize_t)pos;
+    out[i] = '\0';
+    return (ssize_t)i;
 }
 
-/* ------------ User/Client helpers ------------ */
-static int users_find_by_acc(const char *acc) {
-    for (int i = 0; i < MAX_USERS; ++i)
-        if (users[i].in_use && strcmp(users[i].acc, acc) == 0) return i;
+static int find_user_locked(const char *username) {
+    for (int i = 0; i < MAX_USERS; i++) {
+        if (users[i].in_use && strcmp(users[i].username, username) == 0)
+            return i;
+    }
     return -1;
-}
-static int users_free_slot(void) {
-    for (int i = 0; i < MAX_USERS; ++i) if (!users[i].in_use) return i;
-    return -1;
-}
-static bool pass_ok(const char *pwd) {
-    size_t L = strlen(pwd);
-    return L >= 6 && L <= 15;
 }
 
-static int add_client(int fd) {
-    pthread_mutex_lock(&mtx);
-    int idx = -1;
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (!clients[i].in_use) {
-            clients[i].in_use = true;
-            clients[i].fd = fd;
-            clients[i].authed = false;
-            clients[i].user_idx = -1;
-            idx = i;
-            break;
+static int add_user_locked(const char *student_id, const char *username, const char *password) {
+    if (find_user_locked(username) != -1) return -2; // already exists
+    for (int i = 0; i < MAX_USERS; i++) {
+        if (!users[i].in_use) {
+            users[i].in_use = true;
+            snprintf(users[i].student_id, sizeof(users[i].student_id), "%s", student_id);
+            snprintf(users[i].username, sizeof(users[i].username), "%s", username);
+            snprintf(users[i].password, sizeof(users[i].password), "%s", password);
+            return i;
         }
     }
-    pthread_mutex_unlock(&mtx);
-    return idx;
+    return -1; // full
 }
+
+static void broadcast(const char *from_user, const char *msg) {
+    char line[MAX_LINE + 128];
+    snprintf(line, sizeof(line), "[%s]: %s\n", from_user, msg);
+
+    pthread_mutex_lock(&clients_mtx);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd > 0 && clients[i].authed) {
+            send_all(clients[i].fd, line, strlen(line));
+        }
+    }
+    pthread_mutex_unlock(&clients_mtx);
+}
+
 static void remove_client(int fd) {
-    pthread_mutex_lock(&mtx);
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i].in_use && clients[i].fd == fd) {
-            clients[i].in_use = false;
-            clients[i].authed = false;
-            clients[i].user_idx = -1;
+    pthread_mutex_lock(&clients_mtx);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd == fd) {
             clients[i].fd = -1;
+            clients[i].authed = false;
+            clients[i].username[0] = '\0';
             break;
         }
     }
-    pthread_mutex_unlock(&mtx);
+    pthread_mutex_unlock(&clients_mtx);
 }
-
-static void broadcast_authed(const char *fmt, ...) {
-    char line[BUF_SZ];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-    size_t L = strlen(line);
-    if (L == 0 || line[L-1] != '\n') {
-        if (L + 1 < sizeof(line)) { line[L] = '\n'; line[L+1] = '\0'; L++; }
-    }
-    pthread_mutex_lock(&mtx);
-    for (int i = 0; i < MAX_CLIENTS; ++i)
-        if (clients[i].in_use && clients[i].authed)
-            safe_send(clients[i].fd, line, L);
-    pthread_mutex_unlock(&mtx);
-}
-
-static bool parse_kv(const char *line, const char *key, char *out, size_t cap) {
-    size_t k = strlen(key);
-    if (strncmp(line, key, k) != 0 || line[k] != ':') return false;
-    snprintf(out, cap, "%s", line + k + 1);
-    size_t L = strlen(out);
-    while (L && (out[L-1] == '\n' || out[L-1] == '\r')) { out[L-1] = '\0'; --L; }
-    return true;
-}
-
-/* ------------ Per-connection worker ------------ */
-typedef struct { int fd; } arg_t;
 
 static void *client_thread(void *arg) {
-    int cfd = ((arg_t*)arg)->fd;
+    int fd = *(int*)arg;
     free(arg);
 
-    char line[BUF_SZ];
+    // Register phase
+    if (sendf(fd,
+        "=== REGISTER ===\n"
+        "Enter Student ID:\n") < 0) { close(fd); return NULL; }
 
-    // 1) expect SIGNUP block
+    char line[MAX_LINE];
+
+    ssize_t n = recv_line(fd, line, sizeof(line));
+    if (n <= 0) { close(fd); return NULL; }
+    char student_id[32];
+    snprintf(student_id, sizeof(student_id), "%s", line);
+
+    if (sendf(fd, "Enter new username:\n") < 0) { close(fd); return NULL; }
+    n = recv_line(fd, line, sizeof(line));
+    if (n <= 0) { close(fd); return NULL; }
+    char username[MAX_NAME];
+    snprintf(username, sizeof(username), "%s", line);
+
+    // password validation: 6–15 chars
+    char password[MAX_PASS];
     while (1) {
-        ssize_t n = recv_line(cfd, line, sizeof(line));
-        if (n <= 0) goto done;
-
-        if (strncmp(line, "SIGNUP", 6) == 0) {
-            char sid[64] = "", acc[64] = "", pwd[64] = "";
-            if (recv_line(cfd, line, sizeof(line)) <= 0) goto done;
-            if (!parse_kv(line, "SID", sid, sizeof(sid))) { send_line(cfd, "FAIL SIGNUP: bad SID"); continue; }
-            if (recv_line(cfd, line, sizeof(line)) <= 0) goto done;
-            if (!parse_kv(line, "ACC", acc, sizeof(acc))) { send_line(cfd, "FAIL SIGNUP: bad ACC"); continue; }
-            if (recv_line(cfd, line, sizeof(line)) <= 0) goto done;
-            if (!parse_kv(line, "PWD", pwd, sizeof(pwd))) { send_line(cfd, "FAIL SIGNUP: bad PWD"); continue; }
-
-            if (!pass_ok(pwd)) { send_line(cfd, "FAIL SIGNUP: password length 6..15"); continue; }
-
-            pthread_mutex_lock(&mtx);
-            int ui = users_find_by_acc(acc);
-            if (ui != -1) { pthread_mutex_unlock(&mtx); send_line(cfd, "FAIL SIGNUP: account exists"); continue; }
-            int freei = users_free_slot();
-            if (freei == -1) { pthread_mutex_unlock(&mtx); send_line(cfd, "FAIL SIGNUP: user DB full"); continue; }
-
-            users[freei].in_use = true;
-            snprintf(users[freei].sid, sizeof(users[freei].sid), "%s", sid);
-            snprintf(users[freei].acc, sizeof(users[freei].acc), "%s", acc);
-            snprintf(users[freei].pwd, sizeof(users[freei].pwd), "%s", pwd);
-            pthread_mutex_unlock(&mtx);
-
-            send_line(cfd, "OK SIGNUP");
-            break; // proceed to login phase
-        } else {
-            send_line(cfd, "note: please SIGNUP first");
-        }
-    }
-
-    // 2) expect LOGIN block (retry allowed on failure)
-    while (1) {
-        ssize_t n = recv_line(cfd, line, sizeof(line));
-        if (n <= 0) goto done;
-
-        if (strncmp(line, "LOGIN", 5) == 0) {
-            char acc[64] = "", pwd[64] = "";
-            if (recv_line(cfd, line, sizeof(line)) <= 0) goto done;
-            if (!parse_kv(line, "ACC", acc, sizeof(acc))) { send_line(cfd, "FAIL LOGIN: bad ACC"); continue; }
-            if (recv_line(cfd, line, sizeof(line)) <= 0) goto done;
-            if (!parse_kv(line, "PWD", pwd, sizeof(pwd))) { send_line(cfd, "FAIL LOGIN: bad PWD"); continue; }
-
-            pthread_mutex_lock(&mtx);
-            int ui = users_find_by_acc(acc);
-            if (ui == -1) {
-                pthread_mutex_unlock(&mtx);
-                send_line(cfd, "Wrong ID!!!");
-                continue;  // allow retry
-            }
-            if (strcmp(users[ui].pwd, pwd) != 0) {
-                pthread_mutex_unlock(&mtx);
-                send_line(cfd, "Wrong Password!!!");
-                continue;  // allow retry
-            }
-            // bind this socket to authed user
-            for (int i = 0; i < MAX_CLIENTS; ++i)
-                if (clients[i].in_use && clients[i].fd == cfd) { clients[i].authed = true; clients[i].user_idx = ui; break; }
-            char sid[64]; snprintf(sid, sizeof(sid), "%s", users[ui].sid);
-            pthread_mutex_unlock(&mtx);
-
-            send_line(cfd, "OK LOGIN sid:%s", sid);
-            broadcast_authed("SYSTEM: %s joined the chat", sid);
-            break; // go to chat loop
-        } else {
-            send_line(cfd, "note: please LOGIN");
-        }
-    }
-
-    // 3) chat loop
-    while (1) {
-        ssize_t n = recv_line(cfd, line, sizeof(line));
-        if (n <= 0) break;
-
-        if (strncmp(line, "CHAT", 4) == 0) {
-            char msg[BUF_SZ];
-            if (recv_line(cfd, msg, sizeof(msg)) <= 0) break;
-            size_t L = strlen(msg);
-            while (L && (msg[L-1] == '\n' || msg[L-1] == '\r')) { msg[L-1] = '\0'; --L; }
-
-            pthread_mutex_lock(&mtx);
-            const char *sid = NULL;
-            for (int i = 0; i < MAX_CLIENTS; ++i)
-                if (clients[i].in_use && clients[i].fd == cfd && clients[i].authed) {
-                    sid = users[clients[i].user_idx].sid; break;
-                }
-            pthread_mutex_unlock(&mtx);
-
-            if (!sid) { send_line(cfd, "note: not logged in"); continue; }
-            broadcast_authed("[%s]: %s", sid, msg[0] ? msg : "(empty)");
-        } else if (strncmp(line, "EXIT!", 5) == 0) {
+        if (sendf(fd, "Enter new password (6-15 chars):\n") < 0) { close(fd); return NULL; }
+        n = recv_line(fd, line, sizeof(line));
+        if (n <= 0) { close(fd); return NULL; }
+        size_t L = strlen(line);
+        if (L >= 6 && L <= 15) {
+            snprintf(password, sizeof(password), "%s", line);
             break;
-        } else {
-            send_line(cfd, "unknown command");
         }
+        if (sendf(fd, "Password length invalid. Please try again.\n") < 0) { close(fd); return NULL; }
     }
 
-done:
-    // farewell
-    pthread_mutex_lock(&mtx);
-    const char *sid = NULL;
-    for (int i = 0; i < MAX_CLIENTS; ++i)
-        if (clients[i].in_use && clients[i].fd == cfd && clients[i].authed) {
-            sid = users[clients[i].user_idx].sid; break;
-        }
-    pthread_mutex_unlock(&mtx);
-    if (sid) broadcast_authed("SYSTEM: %s left the chat", sid);
+    // Store user
+    pthread_mutex_lock(&users_mtx);
+    int add_rc = add_user_locked(student_id, username, password);
+    pthread_mutex_unlock(&users_mtx);
+    if (add_rc == -2) {
+        sendf(fd, "Username already exists. Proceeding to login...\n");
+    } else if (add_rc < 0) {
+        sendf(fd, "Server user database full. Disconnecting.\n");
+        close(fd);
+        return NULL;
+    } else {
+        sendf(fd, "Registration OK.\n");
+    }
 
-    close(cfd);
-    remove_client(cfd);
-    pthread_exit(NULL);
+    // Login phase
+    while (1) {
+        if (sendf(fd,
+                  "=== LOGIN ===\n"
+                  "Username:\n") < 0) { close(fd); return NULL; }
+        n = recv_line(fd, line, sizeof(line));
+        if (n <= 0) { close(fd); return NULL; }
+        char in_user[MAX_NAME];
+        snprintf(in_user, sizeof(in_user), "%s", line);
+
+        pthread_mutex_lock(&users_mtx);
+        int idx = find_user_locked(in_user);
+        if (idx < 0) {
+            pthread_mutex_unlock(&users_mtx);
+            if (sendf(fd, "Wrong ID!!!\n") < 0) { close(fd); return NULL; }
+            continue;
+        }
+        char expect_pass[MAX_PASS];
+        snprintf(expect_pass, sizeof(expect_pass), "%s", users[idx].password);
+        pthread_mutex_unlock(&users_mtx);
+
+        if (sendf(fd, "Password:\n") < 0) { close(fd); return NULL; }
+        n = recv_line(fd, line, sizeof(line));
+        if (n <= 0) { close(fd); return NULL; }
+        if (strcmp(line, expect_pass) != 0) {
+            if (sendf(fd, "Wrong Password!!!\n") < 0) { close(fd); return NULL; }
+            continue;
+        }
+
+        // success
+        if (sendf(fd, "Login OK. You can chat now. Type /quit to exit.\n") < 0) { close(fd); return NULL; }
+
+        // mark authed in client table
+        pthread_mutex_lock(&clients_mtx);
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].fd == fd) {
+                clients[i].authed = true;
+                snprintf(clients[i].username, sizeof(clients[i].username), "%s", in_user);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&clients_mtx);
+
+        // message loop
+        while (1) {
+            n = recv_line(fd, line, sizeof(line));
+            if (n <= 0) { // disconnect
+                break;
+            }
+            if (strcmp(line, "/quit") == 0) {
+                sendf(fd, "Bye.\n");
+                close(fd);
+                remove_client(fd);
+                return NULL;
+            }
+            // broadcast
+            broadcast(in_user, line);
+        }
+        break;
+    }
+
+    close(fd);
+    remove_client(fd);
     return NULL;
 }
 
-int main(void) {
-    signal(SIGPIPE, SIG_IGN);
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        return 1;
+    }
+    int port = atoi(argv[1]);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
@@ -279,24 +261,52 @@ int main(void) {
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET; sa.sin_addr.s_addr = htonl(INADDR_ANY); sa.sin_port = htons(PORT);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t)port);
+    addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(srv, (struct sockaddr*)&sa, sizeof(sa)) < 0) { perror("bind"); return 1; }
-    if (listen(srv, 32) < 0) { perror("listen"); return 1; }
+    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    if (listen(srv, 16) < 0) { perror("listen"); return 1; }
 
-    printf("Q1 Server listening on %d\n", PORT);
+    // init clients
+    for (int i = 0; i < MAX_CLIENTS; i++) { clients[i].fd = -1; }
+
+    printf("Server listening on port %d ...\n", port);
 
     while (1) {
-        struct sockaddr_in ca; socklen_t cal = sizeof(ca);
-        int cfd = accept(srv, (struct sockaddr*)&ca, &cal);
-        if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); continue; }
+        struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
+        int *cfd = malloc(sizeof(int));
+        if (!cfd) { perror("malloc"); break; }
+        *cfd = accept(srv, (struct sockaddr*)&cli, &clilen);
+        if (*cfd < 0) { perror("accept"); free(cfd); continue; }
 
-        if (add_client(cfd) < 0) { const char *m = "Server busy\n"; safe_send(cfd, m, strlen(m)); close(cfd); continue; }
+        // register in table
+        pthread_mutex_lock(&clients_mtx);
+        bool placed = false;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].fd <= 0) {
+                clients[i].fd = *cfd;
+                clients[i].authed = false;
+                clients[i].username[0] = '\0';
+                placed = true;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&clients_mtx);
 
-        pthread_t th; arg_t *a = (arg_t*)malloc(sizeof(*a)); a->fd = cfd;
-        if (pthread_create(&th, NULL, client_thread, a) != 0) { perror("pthread_create"); close(cfd); remove_client(cfd); continue; }
+        if (!placed) {
+            sendf(*cfd, "Server full. Try later.\n");
+            close(*cfd);
+            free(cfd);
+            continue;
+        }
+
+        pthread_t th;
+        pthread_create(&th, NULL, client_thread, cfd);
         pthread_detach(th);
     }
+
+    close(srv);
     return 0;
 }
