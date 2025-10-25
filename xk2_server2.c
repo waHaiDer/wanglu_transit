@@ -125,54 +125,63 @@ static int add_user_locked(const char *sid, const char *u, const char *pw){
     return -1; // full
 }
 
-/* ---------- menu handlers ---------- */
-static void show_menu(int fd){
+/* ---------- menus ---------- */
+static void show_main_menu(int fd){
     sendf(fd,
-        "\n選擇功能：\n"
-        "1. 新增帳號\n"
-        "2. 修改密碼\n"
-        "3. 登出\n"
-        "請輸入選項 (1-3):\n");
+        "\n=== MAIN MENU ===\n"
+        "1) Login\n"
+        "2) Register new account\n"
+        "3) Exit\n"
+        "Select (1-3):\n");
+}
+static void show_post_login_menu(int fd){
+    sendf(fd,
+        "\n=== MENU ===\n"
+        "1) Register new account\n"
+        "2) Change password\n"
+        "3) Logout\n"
+        "Select (1-3):\n");
 }
 
+/* ---------- actions ---------- */
 static void handle_register(int fd){
     char line[MAX_LINE];
-    if(sendf(fd,"=== 註冊新帳號 ===\n請輸入學號(Student ID):\n")<0) return;
+    if(sendf(fd,"=== Register New Account ===\nEnter Student ID:\n")<0) return;
     if(recv_line_blocking(fd,line,sizeof(line))<=0) return;
     char sid[MAX_STUID]; snprintf(sid,sizeof(sid),"%s",line);
 
-    if(sendf(fd,"請輸入新帳號(Username):\n")<0) return;
+    if(sendf(fd,"Enter new username:\n")<0) return;
     if(recv_line_blocking(fd,line,sizeof(line))<=0) return;
     char uname[MAX_NAME]; snprintf(uname,sizeof(uname),"%s",line);
 
     char pw[MAX_PASS];
     while(1){
-        if(sendf(fd,"請輸入新密碼(6-15字元):\n")<0) return;
+        if(sendf(fd,"Enter new password (6-15 chars):\n")<0) return;
         if(recv_line_blocking(fd,line,sizeof(line))<=0) return;
         size_t L=strlen(line);
         if(L>=6 && L<=15){ snprintf(pw,sizeof(pw),"%s",line); break; }
-        if(sendf(fd,"密碼長度不符規定，請再試一次。\n")<0) return;
+        if(sendf(fd,"Password length invalid. Please try again.\n")<0) return;
     }
 
     pthread_mutex_lock(&users_mtx);
     if(user_count_locked() >= MAX_USERS){
         pthread_mutex_unlock(&users_mtx);
-        sendf(fd,"帳號資料庫已滿(最多3組)。\n");
+        sendf(fd,"User database is full (max 3 accounts).\n");
         return;
     }
     int rc = add_user_locked(sid, uname, pw);
     pthread_mutex_unlock(&users_mtx);
 
-    if(rc == -2)      sendf(fd,"此帳號(Username)已存在，拒絕新增。\n");
-    else if(rc == -3) sendf(fd,"此學號已註冊，拒絕新增。\n");
-    else if(rc < 0)   sendf(fd,"註冊失敗。\n");
-    else              sendf(fd,"註冊成功。\n");
+    if(rc == -2)      sendf(fd,"Username already exists. Registration rejected.\n");
+    else if(rc == -3) sendf(fd,"Student ID already registered. Registration rejected.\n");
+    else if(rc < 0)   sendf(fd,"Registration failed.\n");
+    else              sendf(fd,"Registration OK.\n");
 }
 
 static void handle_change_password(int fd, int user_idx){
     char line[MAX_LINE];
     while(1){
-        if(sendf(fd,"=== 修改密碼 ===\n請輸入新密碼(12-20字元，且需包含至少一個大寫與一個小寫):\n")<0) return;
+        if(sendf(fd,"=== Change Password ===\nEnter new password (12-20 chars; must include upper & lower):\n")<0) return;
         if(recv_line_blocking(fd,line,sizeof(line))<=0) return;
         size_t L=strlen(line);
         bool ok = (L>=12 && L<=20) && has_upper(line) && has_lower(line);
@@ -184,15 +193,66 @@ static void handle_change_password(int fd, int user_idx){
         pthread_mutex_lock(&users_mtx);
         snprintf(users[user_idx].password, sizeof(users[user_idx].password), "%s", line);
         pthread_mutex_unlock(&users_mtx);
-        sendf(fd,"密碼已更新。\n");
+        sendf(fd,"Password changed.\n");
         break;
     }
 }
 
+static int do_login(int fd){
+    // returns user index on success, -1 otherwise (loops until success or user backs out by reconnecting)
+    char line[MAX_LINE];
+
+    // Username
+    if(sendf(fd,"=== Login ===\nUsername:\n")<0) return -1;
+    ssize_t n = recv_line_blocking(fd, line, sizeof(line));
+    if(n <= 0) return -1;
+    char in_user[MAX_NAME]; snprintf(in_user,sizeof(in_user),"%s",line);
+
+    // Lookup & cooldown
+    pthread_mutex_lock(&users_mtx);
+    int idx = find_user_by_username_locked(in_user);
+    if(idx < 0){
+        pthread_mutex_unlock(&users_mtx);
+        sendf(fd,"Wrong ID!!!\n");
+        return -1;
+    }
+    time_t now = time(NULL);
+    if(users[idx].login_cooldown_until > now){
+        int wait = (int)(users[idx].login_cooldown_until - now);
+        pthread_mutex_unlock(&users_mtx);
+        sendf(fd,"Please wait %d seconds before login.\n", wait);
+        return -1;
+    }
+    char expect[MAX_PASS];
+    snprintf(expect,sizeof(expect),"%s",users[idx].password);
+    pthread_mutex_unlock(&users_mtx);
+
+    // Password (5-second limit)
+    if(sendf(fd,"Password (you have 5 seconds):\n")<0) return -1;
+    n = recv_line_timeout(fd, line, sizeof(line), 5);
+    if(n == -2){
+        pthread_mutex_lock(&users_mtx);
+        users[idx].login_cooldown_until = time(NULL) + 10;
+        pthread_mutex_unlock(&users_mtx);
+        sendf(fd,"Login timeout. Please wait 10 seconds before trying again.\n");
+        return -1;
+    }
+    if(n <= 0) return -1;
+
+    if(strcmp(line, expect) != 0){
+        sendf(fd,"Wrong Password!!!\n");
+        return -1;
+    }
+
+    sendf(fd,"Login OK.\n");
+    return idx;
+}
+
+/* ---------- sessions ---------- */
 static void post_login_session(int fd, int user_idx){
     char line[MAX_LINE];
     while(1){
-        show_menu(fd);
+        show_post_login_menu(fd);
         ssize_t n = recv_line_blocking(fd, line, sizeof(line));
         if(n <= 0) return;
         if(strcmp(line,"1")==0){
@@ -200,10 +260,32 @@ static void post_login_session(int fd, int user_idx){
         }else if(strcmp(line,"2")==0){
             handle_change_password(fd, user_idx);
         }else if(strcmp(line,"3")==0){
-            sendf(fd,"您已登出。\n");
+            sendf(fd,"Logged out.\n");
             return;
         }else{
-            sendf(fd,"選項無效。\n");
+            sendf(fd,"Invalid choice.\n");
+        }
+    }
+}
+
+static void main_menu_session(int fd){
+    char line[MAX_LINE];
+    while(1){
+        show_main_menu(fd);
+        ssize_t n = recv_line_blocking(fd, line, sizeof(line));
+        if(n <= 0) return; // disconnect
+        if(strcmp(line,"1")==0){
+            int idx = do_login(fd);
+            if(idx >= 0){
+                post_login_session(fd, idx);  // after logout, return to main menu
+            }
+        }else if(strcmp(line,"2")==0){
+            handle_register(fd);
+        }else if(strcmp(line,"3")==0){
+            sendf(fd,"Goodbye.\n");
+            return;
+        }else{
+            sendf(fd,"Invalid choice.\n");
         }
     }
 }
@@ -211,57 +293,7 @@ static void post_login_session(int fd, int user_idx){
 /* ---------- per-connection ---------- */
 static void *client_thread(void *arg){
     int fd = *(int*)arg; free(arg);
-
-    while(1){
-        // ask username
-        if(sendf(fd,"=== 登入(Login) ===\n請輸入帳號(Username):\n")<0){ close(fd); return NULL; }
-        char line[MAX_LINE];
-        ssize_t n = recv_line_blocking(fd, line, sizeof(line));
-        if(n <= 0){ close(fd); return NULL; }
-        char in_user[MAX_NAME]; snprintf(in_user,sizeof(in_user),"%s",line);
-
-        // lookup
-        pthread_mutex_lock(&users_mtx);
-        int idx = find_user_by_username_locked(in_user);
-        if(idx < 0){
-            pthread_mutex_unlock(&users_mtx);
-            if(sendf(fd,"Wrong ID!!!\n")<0){ close(fd); return NULL; }
-            continue;
-        }
-        time_t now = time(NULL);
-        if(users[idx].login_cooldown_until > now){
-            int wait = (int)(users[idx].login_cooldown_until - now);
-            pthread_mutex_unlock(&users_mtx);
-            if(sendf(fd,"請稍候 %d 秒再嘗試登入。\n", wait)<0){ close(fd); return NULL; }
-            continue;
-        }
-        char expect[MAX_PASS];
-        snprintf(expect,sizeof(expect),"%s",users[idx].password);
-        pthread_mutex_unlock(&users_mtx);
-
-        // password with 5-second limit
-        if(sendf(fd,"請輸入密碼(5秒內完成):\n")<0){ close(fd); return NULL; }
-        n = recv_line_timeout(fd, line, sizeof(line), 5);
-        if(n == -2){
-            pthread_mutex_lock(&users_mtx);
-            users[idx].login_cooldown_until = time(NULL) + 10;
-            pthread_mutex_unlock(&users_mtx);
-            if(sendf(fd,"登入逾時，請 10 秒後再試。\n")<0){ close(fd); return NULL; }
-            continue;
-        }
-        if(n <= 0){ close(fd); return NULL; }
-
-        if(strcmp(line, expect) != 0){
-            if(sendf(fd,"Wrong Password!!!\n")<0){ close(fd); return NULL; }
-            continue;
-        }
-
-        // success → menu
-        if(sendf(fd,"Login OK.\n")<0){ close(fd); return NULL; }
-        post_login_session(fd, idx);
-        // after logout, go back to login loop
-    }
-
+    main_menu_session(fd); // start at main menu (English)
     close(fd);
     return NULL;
 }
