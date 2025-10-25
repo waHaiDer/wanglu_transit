@@ -118,47 +118,66 @@ static void do_B(void){
 }
 
 static void do_C(void){
-    // type letters for up to 10 seconds; we will compress to a single line
-    printf("Type letters for up to 10 seconds; press Enter as you like.\n");
+    // Real-time capture for up to 10s without needing Enter
+    printf("Type letters for up to 10 seconds… (no need to press Enter)\n");
+    fflush(stdout);
 
+    // put terminal in raw mode (no line buffering, no echo)
+    struct termios orig, raw;
+    if (tcgetattr(STDIN_FILENO, &orig) == -1) { perror("tcgetattr"); return; }
+    raw = orig;
+    raw.c_lflag &= ~(ICANON | ECHO);  // non-canonical, no echo
+    raw.c_cc[VMIN]  = 0;              // read returns immediately
+    raw.c_cc[VTIME] = 1;              // 0.1s read timeout
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == -1) { perror("tcsetattr"); return; }
+
+    char buf[4096]; size_t L = 0;
     time_t start = time(NULL);
-    char buf[4096]; size_t L=0;
 
-    while(1){
+    while (1) {
         time_t now = time(NULL);
-        int remain = (int)(10 - (now - start));
-        if(remain <= 0) break;
+        if ((int)(now - start) >= 10) break;
 
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO, &rfds);
+        // wait up to the remaining time; we’ll also loop quickly due to VTIME
+        int remain = 10 - (int)(now - start);
         struct timeval tv = { .tv_sec = remain, .tv_usec = 0 };
-        int rv = select(STDIN_FILENO+1, &rfds, NULL, NULL, &tv);
-        if(rv == 0) break;          // time’s up
-        if(rv < 0){ perror("select"); break; }
+        int rv = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+        if (rv < 0) { if (errno == EINTR) continue; perror("select"); break; }
+        if (rv == 0) continue; // timeout tick; loop to re-check total time
 
-        char line[256];
-        if(!fgets(line,sizeof(line),stdin)) break;
-        size_t add = strlen(line);
-        if(L + add >= sizeof(buf)) add = sizeof(buf)-1 - L;
-        memcpy(buf+L, line, add);
-        L += add; buf[L] = '\0';
+        // read whatever is available (no newline needed in raw mode)
+        char tmp[256];
+        ssize_t n = read(STDIN_FILENO, tmp, sizeof(tmp));
+        if (n > 0) {
+            // append but don’t overflow
+            if (L + (size_t)n > sizeof(buf) - 1) n = (ssize_t)(sizeof(buf) - 1 - L);
+            if (n > 0) {
+                memcpy(buf + L, tmp, (size_t)n);
+                L += (size_t)n;
+                buf[L] = '\0';
+            }
+        }
     }
 
-    // Normalize to ONE LINE: keep only a–z/A–Z; map newlines/tabs/spaces out.
-    char oneline[4096]; size_t k=0;
-    for(size_t i=0; i<L && k+1<sizeof(oneline); ++i){
+    // restore terminal
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+
+    // Normalize to ONE LINE of letters only (server counts letters anyway)
+    char oneline[4096]; size_t k = 0;
+    for (size_t i = 0; i < L && k + 1 < sizeof(oneline); ++i) {
         unsigned char c = (unsigned char)buf[i];
-        if( (c>='A' && c<='Z') || (c>='a' && c<='z') ){
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
             oneline[k++] = (char)c;
-        }
-        // ignore everything else (spaces, newlines, digits, punctuation)
+        // ignore everything else (spaces/newlines/digits/punct)
     }
     oneline[k] = '\0';
 
-    // Send request: code + single-line payload
+    // Send request to server
     if (send_line("C") < 0) { perror("send"); return; }
     if (send_line(oneline) < 0) { perror("send"); return; }
 
-    // Get server response (letter frequency or "No letters found.")
+    // Read server’s frequency result (or "No letters found.") until END
     read_until_END();
 }
 
