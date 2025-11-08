@@ -188,20 +188,15 @@ static void do_chat(int fd, volatile int *logged_in){
         if (!fgets(line, sizeof(line), stdin)) return;
         trim(line);
 
-        if (!strcmp(line, "/menu")) return;          // back to menu
-        if (!strcmp(line, "Exit")) {                 // disconnect
+        if (!strcmp(line, "/menu")) return;      // back to main menu
+        if (!strcmp(line, "Exit")) {             // disconnect from server
             send_line(fd, "EXIT!");
             return;
         }
 
-        // Two common server protocols:
-        // 1) Plain text in chat context (most typical) → send just the message
-        // 2) Or requires a "CHAT" header; if your server expects that, uncomment next two lines
-        // send_line(fd, "CHAT");
-        // send_line(fd, "%s", line[0]?line:"(empty)");
-
-        // Default: send raw line
-        send_line(fd, "%s", line[0]?line:"(empty)");
+        // **This is the important part**
+        send_line(fd, "CHAT");
+        send_line(fd, "%s", line[0] ? line : "(empty)");
     }
 }
 
