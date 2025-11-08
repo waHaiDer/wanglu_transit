@@ -1,19 +1,28 @@
-// client3.c — LAB3 Q3 (fixed: continuous chat mode, no stdin in RX thread)
+// client3.c — LAB3 Q3 (fixed)
 // Build: gcc -O2 -Wall -Wextra -o client3 client3.c -lpthread
-// Run:   ./client3                (defaults 127.0.0.1:5678)
+// Run  : ./client3                 (defaults to 127.0.0.1:5678)
 //        ./client3 <ip> [port]
 //
 // Menu:
 //   1) Sign up
 //   2) Login
-//   3) Chat (Hall/Room)   — continuous until /menu or Exit
+//   3) Chat (continuous; /menu to return; Exit to disconnect)
 //   4) Create private room
 //   5) Leave room
 //   q) Exit
 //
-// Extra commands (type at main menu prompt):
-//   /accept <TOKEN>    — accept an invite printed by RX thread
-//   /reject <TOKEN>    — reject an invite
+// Extra commands at menu prompt:
+//   /accept <TOKEN>     — accept invite
+//   /reject <TOKEN>     — reject invite
+//
+// Protocol (what this client now sends):
+//   SIGNUP + SID/ACC/PWD lines
+//   LOGIN  + ACC/PWD lines
+//   CHAT <message>                 <-- single-line chat
+//   CREATEPRV <sock1> [<sock2>]    <-- no count
+//   INVITE_RESP <TOKEN> YES|NO
+//   LEAVE
+//   EXIT!
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -34,6 +43,8 @@
 #endif
 
 #define BUF_SZ 4096
+
+static int g_debug = 1;  // set to 0 to silence ">>" send logs
 
 static void safe_send(int fd, const char *buf, size_t len){
     size_t off = 0;
@@ -57,6 +68,14 @@ static void send_line(int fd, const char *fmt, ...){
     if (L == 0 || out[L-1] != '\n') {
         if (L + 1 < sizeof(out)) { out[L] = '\n'; out[L+1] = '\0'; L++; }
     }
+    if (g_debug) {
+        // Print without the trailing newline for clarity
+        char shown[BUF_SZ];
+        strncpy(shown, out, sizeof(shown)-1); shown[sizeof(shown)-1] = '\0';
+        size_t SL = strlen(shown);
+        if (SL && shown[SL-1]=='\n') shown[SL-1]='\0';
+        fprintf(stderr, ">> %s\n", shown);
+    }
     safe_send(fd, out, L);
 }
 
@@ -79,10 +98,7 @@ static void trim(char *s){
     while (L && (s[L-1] == '\n' || s[L-1] == '\r')) { s[L-1] = '\0'; L--; }
 }
 
-static bool valid_len(const char *s){
-    size_t L = strlen(s);
-    return L >= 8 && L <= 15;
-}
+static bool valid_len(const char *s){ size_t L = strlen(s); return L >= 8 && L <= 15; }
 static bool has_upper_symbol(const char *s){
     bool up=false, sym=false;
     for (const unsigned char *p=(const unsigned char*)s; *p; ++p){
@@ -92,10 +108,7 @@ static bool has_upper_symbol(const char *s){
     return up && sym;
 }
 
-typedef struct {
-    int fd;
-    volatile int logged_in;
-} rx_arg_t;
+typedef struct { int fd; volatile int logged_in; } rx_arg_t;
 
 static void *rx_thread(void *arg){
     rx_arg_t *rx = (rx_arg_t*)arg;
@@ -106,25 +119,18 @@ static void *rx_thread(void *arg){
         ssize_t n = recv_line(fd, line, sizeof(line));
         if (n <= 0) break;
 
-        // Print everything from server
         fputs(line, stdout);
 
-        // Mark login success for a few common server phrases
         if (strstr(line, "OK LOGIN") || strstr(line, "LOGIN OK") || strstr(line, "LOGIN_SUCCESS"))
             rx->logged_in = 1;
 
-        // Capacity message (example)
         if (!strncmp(line, "Server is full!", 15)) {
             fprintf(stderr, "Disconnected: server reports full capacity.\n");
             shutdown(fd, SHUT_RDWR); close(fd); exit(0);
         }
 
-        // Invitations: DO NOT read stdin here; just show token and instructions
-        // Expected line examples:
-        //   INVITE <TOKEN> FROM <SockID> : ...
-        //   INVITE <TOKEN> ...
+        // Show how to respond to invites, but do NOT read stdin here
         if (!strncmp(line, "INVITE ", 7)) {
-            // Try to extract token (first word after INVITE)
             char token[128]={0};
             if (sscanf(line, "INVITE %127s", token) == 1) {
                 printf("Type '/accept %s' to accept, or '/reject %s' to decline.\n", token, token);
@@ -132,10 +138,9 @@ static void *rx_thread(void *arg){
                 printf("To respond, type /accept <TOKEN> or /reject <TOKEN>.\n");
             }
         }
-
         fflush(stdout);
     }
-    // server closed
+    // server closed or error
     exit(0);
     return NULL;
 }
@@ -193,10 +198,10 @@ static void do_chat(int fd, volatile int *logged_in){
             send_line(fd, "EXIT!");
             return;
         }
+        if (line[0] == '\0') continue;           // ignore empty messages
 
-        // **This is the important part**
-        send_line(fd, "CHAT");
-        send_line(fd, "%s", line[0] ? line : "(empty)");
+        // **Single-line chat expected by your server**
+        send_line(fd, "CHAT %s", line);
     }
 }
 
@@ -216,9 +221,9 @@ static void do_create_private(int fd, volatile int *logged_in){
         if (!fgets(line, sizeof(line), stdin)) return; trim(line); s2 = atoi(line);
     }
 
-    // If your server expects a different command name/format, adjust here:
-    if (k == 1) send_line(fd, "CREATEPRV %d %d", k, s1);
-    else        send_line(fd, "CREATEPRV %d %d %d", k, s1, s2);
+    // **No-count format** (most servers): CREATEPRV <sock1> [<sock2>]
+    if (k == 1) send_line(fd, "CREATEPRV %d", s1);
+    else        send_line(fd, "CREATEPRV %d %d", s1, s2);
 
     printf("Invite sent. Watch for 'INVITE <TOKEN> ...' then respond with /accept or /reject.\n");
 }
