@@ -79,6 +79,16 @@ static void send_line(int fd, const char *fmt, ...){
     safe_send(fd, out, L);
 }
 
+static void chat_send_raw(int fd, const char *text){           // raw line
+    send_line(fd, "%s", text);
+}
+static void chat_send_chat(int fd, const char *text){           // "CHAT <msg>"
+    send_line(fd, "CHAT %s", text);
+}
+static void chat_send_msg(int fd, const char *text){            // "MSG <msg>"
+    send_line(fd, "MSG %s", text);
+}
+
 static ssize_t recv_line(int fd, char *out, size_t cap){
     size_t pos = 0;
     while (pos + 1 < cap) {
@@ -186,22 +196,26 @@ static void do_chat(int fd, volatile int *logged_in){
     if (!*logged_in) { printf("Please login first.\n"); return; }
 
     printf("=== Chat mode ===\n");
-    printf("Type your message. Commands: '/menu' to return, 'Exit' to disconnect.\n");
+    printf("Type message, or use:\n");
+    printf("  /raw <text>   (send as-is)\n");
+    printf("  /chat <text>  (send as: CHAT <text>)\n");
+    printf("  /msg <text>   (send as:  MSG <text>)\n");
+    printf("Commands: '/menu' back, 'Exit' disconnect.\n");
 
     char line[BUF_SZ];
-    while (1) {
-        if (!fgets(line, sizeof(line), stdin)) return;
+    while (fgets(line, sizeof(line), stdin)) {
         trim(line);
+        if (!*line) continue;
+        if (!strcmp(line, "/menu")) return;
+        if (!strcmp(line, "Exit")) { send_line(fd, "EXIT!"); return; }
 
-        if (!strcmp(line, "/menu")) return;      // back to main menu
-        if (!strcmp(line, "Exit")) {             // disconnect from server
-            send_line(fd, "EXIT!");
-            return;
+        if      (!strncmp(line, "/raw ", 5))  chat_send_raw(fd,  line+5);
+        else if (!strncmp(line, "/chat ",6))  chat_send_chat(fd, line+6);
+        else if (!strncmp(line, "/msg ", 5))  chat_send_msg(fd,  line+5);
+        else {
+            // default try #1: MSG <text>. If server says "unknown", try /raw or /chat.
+            chat_send_msg(fd, line);
         }
-        if (line[0] == '\0') continue;           // ignore empty messages
-
-        // **Single-line chat expected by your server**
-        send_line(fd, "CHAT %s", line);
     }
 }
 
